@@ -984,6 +984,8 @@ class ODIN(nn.Module):
                     scannet_gt_target_dicts, scannet_p2v, num_classes,
                     scannet_idxs, scannet_segments_batched
                 )
+                if self.cfg.EXPORT_BACKBONE_FEATURES:
+                    return processed_results, features
                 return processed_results
             
             # Normal Processing
@@ -992,6 +994,8 @@ class ODIN(nn.Module):
                 images, [bs, v, H_padded, W_padded], targets,
                 num_classes, decoder_3d, multiview_data
             )
+            if self.cfg.EXPORT_BACKBONE_FEATURES:
+                return processed_results, features        
                 
             return processed_results
 

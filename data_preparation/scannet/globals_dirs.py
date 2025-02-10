@@ -1,6 +1,6 @@
 
 # SAVING DIRECTORY - CHANGE THIS
-DATA_DIR = '/projects/katefgroup/odin/scannet' # This is path to the folder which contains the RGRB-D data (not scannet point cloud data)
+DATA_DIR = '/mnt/ssd/liuchao/odin/scannet/frames_square_highres' # This is path to the folder which contains the RGRB-D data (not scannet point cloud data)
 SPLITS_PATH = 'splits/scannet_splits'
 
 SPLITS = {

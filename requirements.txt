@@ -8,7 +8,7 @@ natsort
 plyfile
 prettytable
 torchinfo
-pyyaml==5.3.1
+pyyaml>=6.0  #==5.3.1
 scipy
 transformers
 ipdb

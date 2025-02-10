@@ -18,7 +18,9 @@ import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
 
+import numpy as np
 import torch
+from torch import nn
 
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
@@ -64,6 +66,10 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 import ipdb
 st = ipdb.set_trace
+
+from contextlib import ExitStack, contextmanager
+
+from tqdm import tqdm
 
 
 class OneCycleLr_D2(torch.optim.lr_scheduler.OneCycleLR):
@@ -558,7 +564,144 @@ class Trainer(DefaultTrainer):
 
         self._trainer.grad_scaler.step(self.optimizer)
         self._trainer.grad_scaler.update()  
+
+    @classmethod
+    def save_output(cls, cfg, model, path = None, align_file_path = None):
         
+        if not os.path.exists(path):
+            os.makedirs(path)
+        
+        @contextmanager
+        def inference_context(model):
+            """
+            A context where the model is temporarily changed to eval mode,
+            and restored to previous mode afterwards.
+
+            Args:
+                model: a torch Module
+            """
+            training_mode = model.training
+            model.eval()
+            yield
+            model.train(training_mode)
+        
+        for _, dataset_name in enumerate(cfg.DATASETS.TEST):
+
+            with ExitStack() as stack:
+                if isinstance(model, nn.Module):
+                    stack.enter_context(inference_context(model))
+                stack.enter_context(torch.no_grad())
+            
+            data_loader = cls.build_test_loader(cfg, dataset_name)
+            #data_loader = cls.build_train_loader(cfg)
+            #print("Start inference on {} batches".format(len(data_loader)))
+            #output = []
+            for  data in tqdm(data_loader):
+                #print(len(data))
+                #print_dict(data[0])
+                #print('depth_file_names', len(data[0]['depth_file_names']) )
+                #print(data[0]['file_name'])
+                scene_id = data[0]['image_id']
+                
+                scannet_coords = data[0]['scannet_coords'].cpu().numpy()
+                align_matrix = np.eye(4)
+                with open(os.path.join(align_file_path, scene_id, '%s.txt'%(scene_id)), 'r') as f:
+                    for line in f:
+                        if line.startswith('axisAlignment'):
+                            align_matrix = np.array([float(x) for x in line.strip().split()[-16:]]).astype(np.float32).reshape(4, 4)
+                            break
+                
+                pts = np.ones((scannet_coords.shape[0], 4), dtype=scannet_coords.dtype)
+                pts[:, 0:3] = scannet_coords
+                align_coords = np.dot(pts, align_matrix.transpose())[:, :3]  # Nx4
+                assert (np.sum(np.isnan(align_coords)) == 0)
+                
+                
+                scannet_color = data[0]['scannet_color'].cpu().numpy()
+                
+                
+                    
+                model.eval()
+                with torch.no_grad():
+                    results, feature = model(data)
+                    results_i = results[0]
+                    #print_dict(results_i)
+                    #print_dict(feature)
+                    pred_ins_id = results_i['instances_3d']['pred_masks'].cpu().transpose(0,1).numpy()
+                    #print(pred_ins_id.shape)
+                    #pred_ins_id = pred_ins_masks.argmax(1).numpy()
+                    #print(pred_ins_id[:200])
+                    
+                    pred_sem_id = results_i['semantic_3d'].cpu().numpy()
+                    #print(pred_sem_id[:20])
+                    
+                    img_feature = {}
+                    for k, v in feature.items():
+                        img_feature[k] = v.cpu().numpy()
+                    
+                    #output.append(results_i)
+                    torch.save(( align_coords, scannet_color, pred_sem_id, pred_ins_id, img_feature ), f'{path}/{scene_id}.pth')
+            #results[dataset_name] = output
+                #break
+
+
+def print_dict(d, n = 0):
+    if isinstance(d, dict):
+        for k, v in d.items():
+            print('  '*n, k)
+            print_dict(v, n+1 )
+    elif isinstance(d, torch.Tensor):
+        print('  '*n, d.shape)
+    elif isinstance(d, list):
+        for i in d:
+            print_dict(i, n+1)
+    #elif isinstance(d, int):
+    else:
+        print('  '*n, d)
+
+def compute_3d_bounding_boxes(points: torch.Tensor, instance_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute 3D bounding boxes for multiple instances.
+    
+    Args:
+        points (torch.Tensor): Tensor of shape (N, 3) containing 3D point coordinates.
+        instance_mask (torch.Tensor): Boolean tensor of shape (N, I) where I is the number
+                                        of instances. True indicates the point belongs to the instance.
+    
+    Returns:
+        torch.Tensor: A tensor of shape (I, 6) where each row is [x_min, y_min, z_min, x_max, y_max, z_max]
+                      for the corresponding instance.
+    """
+    # Number of instances (I)
+    num_instances = instance_mask.shape[1]
+    bboxes = []
+
+    for i in range(num_instances):
+        # Get the mask for the current instance: shape (N,)
+        mask = instance_mask[:, i]
+        # Check if any points belong to this instance
+        if mask.sum() == 0:
+            # If no points, we can set a default box (or you might choose to skip/raise an error)
+            bbox = torch.zeros(6, dtype=points.dtype, device=points.device)
+        else:
+            # Select the points that belong to the current instance
+            pts = points[mask]  # shape (n_i, 3) where n_i is the number of points in instance i
+            # Compute min and max along each axis (dim=0)
+            min_vals, _ = pts.min(dim=0)
+            max_vals, _ = pts.max(dim=0)
+            size = max_vals - min_vals
+            center = (max_vals + min_vals) / 2
+            # Concatenate the minimum and maximum coordinates to form the bounding box
+            bbox = torch.cat([min_vals, max_vals], dim=0)  # shape (6,)
+        bboxes.append(bbox)
+
+    # Stack all bounding boxes into a tensor of shape (I, 6)
+    return torch.stack(bboxes, dim=0)
+
+
+
+
+
 def setup(args):
     """
     Create configs and perform basic setups.
@@ -588,6 +731,16 @@ def main(args):
         if cfg.TEST.AUG.ENABLED:
             raise NotImplementedError
         return res
+    elif args.save_output:
+        #print("################# Saving Output #################")
+        model = Trainer.build_model(cfg)
+        DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
+            cfg.MODEL.WEIGHTS, resume=args.resume
+        )
+        res = Trainer.save_output(cfg, model, 
+                                  path='/mnt/ssd/liuchao/odin/odin_3d_ins_seg2', 
+                                  align_file_path='/mnt/ssd/liuchao/ScanNet/scans')  
+        return res     
 
     trainer = Trainer(cfg)
     trainer.resume_or_load(resume=args.resume)
@@ -595,7 +748,9 @@ def main(args):
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    paser = default_argument_parser()
+    paser.add_argument("--save_output", action="store_true")
+    args = paser.parse_args()
     print("Command Line Args:", args)
     
     # this is needed to prevent memory leak in conv2d layers
