@@ -19,7 +19,7 @@ INPUT.SAMPLE_CHUNK_AUG True \
 MODEL.MASK_FORMER.TRAIN_NUM_POINTS 50000 \
 MODEL.CROSS_VIEW_BACKBONE True \
 DATASETS.TRAIN "('scannet_context_instance_train_20cls_single_highres_100k',)" \
-DATASETS.TEST "('scannet_context_instance_train_20cls_single_highres_100k','scannet_context_instance_val_20cls_single_highres_100k','scannet_context_instance_train_eval_20cls_single_highres_100k',)" \
+DATASETS.TEST "('scannet_context_instance_train_20cls_single_highres_100k', 'scannet_context_instance_val_20cls_single_highres_100k', 'scannet_context_instance_train_eval_20cls_single_highres_100k',)" \
 MODEL.PIXEL_DECODER_PANET True \
 MODEL.SEM_SEG_HEAD.NUM_CLASSES 20 \
 MODEL.MASK_FORMER.TEST.SEMANTIC_ON True \

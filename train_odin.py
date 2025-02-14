@@ -22,6 +22,8 @@ import numpy as np
 import torch
 from torch import nn
 
+from scipy.spatial import ConvexHull
+
 import detectron2.utils.comm as comm
 from detectron2.checkpoint import DetectionCheckpointer
 from torch.nn.parallel import DistributedDataParallel
@@ -58,6 +60,7 @@ from odin import (
     get_detection_dataset_dicts,
     build_detection_train_loader_multi_task,
 )
+
 from odin.data_video.build import merge_datasets
 from odin.global_vars import SCANNET_LIKE_DATASET
 from torchinfo import summary
@@ -585,6 +588,7 @@ class Trainer(DefaultTrainer):
             yield
             model.train(training_mode)
         
+        #all_feats = {}
         for _, dataset_name in enumerate(cfg.DATASETS.TEST):
 
             with ExitStack() as stack:
@@ -596,51 +600,116 @@ class Trainer(DefaultTrainer):
             #data_loader = cls.build_train_loader(cfg)
             #print("Start inference on {} batches".format(len(data_loader)))
             #output = []
+            #all_feats = {}
             for  data in tqdm(data_loader):
-                #print(len(data))
+                #print(data[0].keys())
                 #print_dict(data[0])
                 #print('depth_file_names', len(data[0]['depth_file_names']) )
                 #print(data[0]['file_name'])
                 scene_id = data[0]['image_id']
+                scannet_coords = data[0]['scannet_coords'] 
+                intrinsics = torch.stack(data[0]['intrinsics'] )
+                image_shape = ( 256, 320 )
+                poses = torch.stack(data[0]['poses'])
+                # images = data[0]['images']
+                # all_classes = data[0]['all_classes']
+                # image_file_names = data[0]['file_names']
+                # align_matrix = np.eye(4)
+                # with open(os.path.join(align_file_path, scene_id, '%s.txt'%(scene_id)), 'r') as f:
+                #     for line in f:
+                #         if line.startswith('axisAlignment'):
+                #             align_matrix = np.array([float(x) for x in line.strip().split()[-16:]]).astype(np.float32).reshape(4, 4)
+                #             break
+                # pts = torch.ones((scannet_coords.shape[0], 4), dtype=scannet_coords.dtype)
+                # pts[:, 0:3] = scannet_coords
                 
-                scannet_coords = data[0]['scannet_coords'].cpu().numpy()
-                align_matrix = np.eye(4)
-                with open(os.path.join(align_file_path, scene_id, '%s.txt'%(scene_id)), 'r') as f:
-                    for line in f:
-                        if line.startswith('axisAlignment'):
-                            align_matrix = np.array([float(x) for x in line.strip().split()[-16:]]).astype(np.float32).reshape(4, 4)
-                            break
+                # align_coords = torch.matmul(pts, torch.tensor(align_matrix, device=pts.device, dtype=pts.dtype).T)[:, :3]
+                # #align_coords = np.dot(pts, align_matrix.transpose())[:, :3]  # Nx4
+                # assert (torch.sum(torch.isnan(align_coords)) == 0)
                 
-                pts = np.ones((scannet_coords.shape[0], 4), dtype=scannet_coords.dtype)
-                pts[:, 0:3] = scannet_coords
-                align_coords = np.dot(pts, align_matrix.transpose())[:, :3]  # Nx4
-                assert (np.sum(np.isnan(align_coords)) == 0)
+                #scannet_color = data[0]['scannet_color'].cpu().numpy()
                 
-                
-                scannet_color = data[0]['scannet_color'].cpu().numpy()
-                
-                
-                    
+                              
                 model.eval()
+                scene_feats = {}
                 with torch.no_grad():
                     results, feature = model(data)
                     results_i = results[0]
                     #print_dict(results_i)
                     #print_dict(feature)
-                    pred_ins_id = results_i['instances_3d']['pred_masks'].cpu().transpose(0,1).numpy()
+                    pred_ins_masks = results_i['instances_3d']['pred_masks'].cpu()
+                    ins_num = pred_ins_masks.shape[1]
+                    #ins_cat = results_i['instances_3d']['pred_classes'].cpu().numpy()
+                    
+                    # gt_ins_masks = results_i['instances_3d']['scannet_gt_masks'].cpu()
+                    # gt_ins_cat = results_i['instances_3d']['scannet_gt_classes'].cpu().numpy()
+                    # gt_ins_num = gt_ins_masks.shape[0]
                     #print(pred_ins_id.shape)
                     #pred_ins_id = pred_ins_masks.argmax(1).numpy()
                     #print(pred_ins_id[:200])
                     
-                    pred_sem_id = results_i['semantic_3d'].cpu().numpy()
+                    #pred_sem_id = results_i['semantic_3d'].cpu().numpy()
                     #print(pred_sem_id[:20])
                     
-                    img_feature = {}
-                    for k, v in feature.items():
-                        img_feature[k] = v.cpu().numpy()
+
                     
-                    #output.append(results_i)
-                    torch.save(( align_coords, scannet_color, pred_sem_id, pred_ins_id, img_feature ), f'{path}/{scene_id}.pth')
+                    img_features = {}
+                    for k, v in feature.items():
+                        img_features[k] = v.permute(0, 2, 3, 1)
+                    
+                    
+                    for i in range(ins_num):
+                        ins_pc = scannet_coords[pred_ins_masks[:, i].bool()]
+                        if ins_pc.shape[0] == 0:
+                            continue
+                        
+                        
+                        ins_img_masks = map_3d_points_to_2d(ins_pc, intrinsics, poses, image_shape)
+                        
+                        # for b in range(ins_img_masks.shape[0]):
+                        #     if ins_img_masks[b].sum() < 100:
+                        #         continue
+                        #     visualize_projection(b, ins_img_masks[b], images[b], output_dir=f'{path}/{scene_id}/{i:02}_{all_classes[ins_cat[i]-1]}' ) 
+                        
+                        # if i > 20:
+                        #     break
+                        # continue
+
+                        ins_feat = {}
+                        for k, feats in img_features.items():
+                            scale = ins_img_masks.shape[1] // feats.shape[1]
+                            ins_feat_mask = max_pooling_masks(ins_img_masks, scale)
+                            # print(ins_img_masks.shape)
+                            # print(ins_feat_mask.shape)
+                            # print(feats.shape)
+                            assert ins_feat_mask.shape == feats.shape[:3]
+                            ins_multiview_feats = []
+                            for b in range(ins_feat_mask.shape[0]):
+                                feat = feats[b].view(-1, feats.shape[-1])
+                                mask = ins_feat_mask[b].view(-1)
+                                if mask.sum() == 0:
+                                    continue
+                                # print(feat[mask].shape)
+                                # print( feats[b][ins_feat_mask[b]].shape)
+                                # return
+                                ins_multiview_feat = feat[mask].mean(0)
+                                ins_multiview_feats.append( {"volume": mask.sum(), 
+                                                             "feat": ins_multiview_feat.cpu().detach()
+                                                             })
+                                
+                            ins_multiview_feats.sort(key=lambda x: x["volume"], reverse=True)
+                            ins_feat[k] = ins_multiview_feats[:4] if len(ins_multiview_feats) > 4 else ins_multiview_feats
+                            #print_dict(ins_feat)
+                            # only keep the top 4 views
+                        #print(f"{scene_id}: {len(all_feats)}/{ins_num}")
+                        
+                        scene_feats[f"{scene_id}_{i:02}"] = ins_feat
+                torch.save(scene_feats, f'{path}/{scene_id}.pt')
+                print(f"{scene_id}: {len(scene_feats)}/{ins_num}")
+                    
+        #torch.save(all_feats, path)
+        #print(f"{scene_id}: {len(all_feats)}/{ins_num}")
+                    #torch.save(( scannet_coords, scannet_color, pred_sem_id, pred_ins_id, img_feature ), f'{path}/{scene_id}.pth')
             #results[dataset_name] = output
                 #break
 
@@ -699,6 +768,199 @@ def compute_3d_bounding_boxes(points: torch.Tensor, instance_mask: torch.Tensor)
     return torch.stack(bboxes, dim=0)
 
 
+def visualize_projection(b, shot_mask, image, output_dir="output_images"):
+    """
+    Visualize the projection of 3D points onto a 2D image and save the output images.
+    Args:
+        b (int): Batch index.
+        shot_mask (torch.Tensor): Tensor of shape (H, W) containing the mask.
+        image (torch.Tensor): Tensor of shape (3, H, W) containing the image.
+        output_dir (str): Directory to save the output images.
+    """
+    import matplotlib.pyplot as plt
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # Convert the image tensor to a numpy array and transpose to (H, W, 3)
+    image_np = image.permute(1, 2, 0).cpu().numpy()
+
+    plt.figure(figsize=(10, 10))
+    plt.imshow(image_np)
+    mask = shot_mask.cpu().numpy()
+    plt.imshow(mask, alpha=0.5, cmap='Reds')
+    plt.title(f"Projection on Image {b}")
+
+    output_path = os.path.join(output_dir, f"projection_{b}.jpg")
+    plt.savefig(output_path)
+    plt.close()
+    
+    
+
+        
+def map_3d_points_to_2d(points, intrinsics, poses, image_size):
+    """
+    Map 3D points to 2D image coordinates.
+
+    Args:
+        points (torch.Tensor): Tensor of shape (N, 3) containing 3D point coordinates.
+        intrinsics (torch.Tensor): Tensor of shape (B, 3, 3) containing camera intrinsics.
+        poses (torch.Tensor): Tensor of shape (B, 4, 4) containing camera poses.
+        image_size (tuple): Tuple (H, W) representing the image size.
+
+    Returns:
+        torch.Tensor: Tensor of shape (B, H, W) containing the shot mask.
+    """
+    from skimage.draw import polygon
+    
+    N = points.shape[0]
+    B, _, _ = intrinsics.shape
+    H, W = image_size
+
+    # # Convert points to homogeneous coordinates
+    # points_h = torch.cat([points, torch.ones(N, 1, device=points.device)], dim=1)  # (N, 4)
+
+    shot_masks = torch.zeros((B, H, W), dtype=torch.bool, device=points.device)
+
+    # poses_inv = torch.inverse(poses)
+    points = points.unsqueeze(0).expand(B, -1, -1)
+    points_2d, valid_mask = project(intrinsics, poses, points, image_size)
+    
+    for i in range(B):
+        
+        points_2d_i = points_2d[i][valid_mask[i]]
+
+        if points_2d_i.shape[0] < 3:
+            continue
+
+        # Compute the convex hull of the projected points
+        try:
+            hull = ConvexHull(points_2d_i.cpu().numpy())
+        except:
+            continue
+        
+        hull_points = points_2d_i[hull.vertices]
+
+        # Create a mask for the convex hull
+        rr, cc = polygon(hull_points[:, 1].cpu().numpy(), hull_points[:, 0].cpu().numpy(), (H, W))
+        shot_masks[i, rr, cc] = True
+
+    return shot_masks
+
+def project(intrinsics, poses, world_coords, image_size):
+    """
+    Projects 3D world coordinates back to 2D image coordinates and filters out invalid points.
+
+    Inputs:
+        intrinsics: B X 3 X 3 (camera intrinsics)
+        poses: B X 4 X 4 (camera extrinsics)
+        world_coords: B X N X 3 (3D world coordinates)
+        image_size: tuple (H, W) representing the image dimensions
+
+    Outputs:
+        valid_pixel_coords: List of tensors of shape (N_valid, 2) containing only valid 2D pixel coordinates
+        valid_mask: List of tensors of shape (N_valid,) indicating valid points
+    """
+    B, N, _ = world_coords.shape
+    img_H, img_W = image_size
+
+    # Convert 3D world coordinates to homogeneous form (B, N, 4)
+    ones = torch.ones((B, N, 1), device=world_coords.device)
+    world_coords_h = torch.cat([world_coords, ones], dim=-1)  # B X N X 4
+
+    # Transform world coordinates to camera coordinates (B X N X 4)
+    cam_coords_h = torch.matmul(torch.inverse(poses), world_coords_h.transpose(1, 2)).transpose(1, 2)  # B X N X 4
+
+    # Convert to non-homogeneous 3D camera coordinates
+    cam_coords = cam_coords_h[..., :3] / cam_coords_h[..., 3:4]  # B X N X 3
+
+    # Extract intrinsics parameters
+    fx = intrinsics[:, 0, 0].unsqueeze(1)  # B X 1
+    fy = intrinsics[:, 1, 1].unsqueeze(1)  # B X 1
+    px = intrinsics[:, 0, 2].unsqueeze(1)  # B X 1
+    py = intrinsics[:, 1, 2].unsqueeze(1)  # B X 1
+
+    # Compute 2D pixel coordinates
+    x = (cam_coords[..., 0] * fx / cam_coords[..., 2]) + px
+    y = (cam_coords[..., 1] * fy / cam_coords[..., 2]) + py
+
+    # Stack pixel coordinates
+    pixel_coords = torch.stack([x, y], dim=-1)  # B X N X 2
+
+    # Validity mask: check if points are in front of the camera and within image bounds
+    valid = (cam_coords[..., 2] > 0) & (x >= 0) & (x < img_W) & (y >= 0) & (y < img_H)
+
+    # # Collect only valid points per batch
+    # valid_pixel_coords = []
+    # valid_mask = []
+
+    # for b in range(B):
+    #     valid_points = pixel_coords[b][valid[b]]  # Extract valid 2D points
+    #     valid_pixel_coords.append(valid_points)
+    #     valid_mask.append(valid[b])  # Flatten validity mask
+
+    return pixel_coords, valid
+
+# def project(intrinsics, poses, world_coords):
+#     """
+#     Projects 3D world coordinates back to 2D image coordinates.
+
+#     Inputs:
+#         intrinsics: B X V X 3 X 3 (camera intrinsics)
+#         poses: B X V X 4 X 4 (camera extrinsics)
+#         world_coords: B X V X H X W X 3 (3D world coordinates)
+
+#     Outputs:
+#         pixel_coords: B X V X H X W X 2 (2D pixel coordinates in image space)
+#         valid: B X V X H X W (bool indicating valid points)
+#     """
+#     B, V, H, W, _ = world_coords.shape
+
+#     # Convert world coordinates to homogeneous coordinates
+#     ones = torch.ones_like(world_coords[..., :1])
+#     world_coords_h = torch.cat([world_coords, ones], dim=-1)  # B X V X H X W X 4
+
+#     # Transform world coordinates to camera coordinates
+#     cam_coords_h = torch.matmul(torch.inverse(poses), world_coords_h.unsqueeze(-1))  # B X V X H X W X 4 X 1
+#     cam_coords_h = cam_coords_h.squeeze(-1)  # B X V X H X W X 4
+
+#     # Convert to 3D camera coordinates (remove homogeneous scale)
+#     cam_coords = cam_coords_h[..., :3] / cam_coords_h[..., 3:4]  # B X V X H X W X 3
+
+#     # Extract intrinsics
+#     fx = intrinsics[..., 0, 0][..., None, None, None]  # B X V X 1 X 1 X 1
+#     fy = intrinsics[..., 1, 1][..., None, None, None]
+#     px = intrinsics[..., 0, 2][..., None, None, None]
+#     py = intrinsics[..., 1, 2][..., None, None, None]
+
+#     # Compute 2D pixel coordinates
+#     x = (cam_coords[..., 0] * fx / cam_coords[..., 2]) + px
+#     y = (cam_coords[..., 1] * fy / cam_coords[..., 2]) + py
+
+#     # Stack to get final pixel coordinates
+#     pixel_coords = torch.stack([x, y], dim=-1)  # B X V X H X W X 2
+
+#     # Validity mask: check if points are in front of the camera
+#     valid = cam_coords[..., 2] > 0  # Depth must be positive
+
+#     return pixel_coords, valid
+
+
+
+
+def max_pooling_masks(masks: torch.Tensor, scale: int) -> torch.Tensor:
+    """
+    Apply max pooling to masks and ensure the output mask type is bool.
+
+    Args:
+        masks (torch.Tensor): Tensor of shape (B, H, W) containing masks.
+        scale (int): Pooling scale, e.g., 2, 4, 8, 16.
+
+    Returns:
+        torch.Tensor: Tensor of shape (B, H//scale, W//scale) containing pooled masks.
+    """
+    pooled_masks = nn.functional.max_pool2d(masks.unsqueeze(1).float(), kernel_size=scale).squeeze(1)
+    return pooled_masks.bool()
 
 
 
@@ -737,9 +999,16 @@ def main(args):
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(
             cfg.MODEL.WEIGHTS, resume=args.resume
         )
+        out_dir = '/mnt/ssd/liuchao/odin/odin_3d_ins_seg2'
         res = Trainer.save_output(cfg, model, 
-                                  path='/mnt/ssd/liuchao/odin/odin_3d_ins_seg2', 
+                                  path= out_dir,  #'/mnt/ssd/liuchao/odin/odin_3d_ins_seg2', 
                                   align_file_path='/mnt/ssd/liuchao/ScanNet/scans')  
+        all_feats = {}
+        for filename in os.listdir(out_dir):
+            if filename.endswith('.pt'):
+                all_feats.update(torch.load(os.path.join(out_dir, filename), map_location='cpu'))
+        torch.save(all_feats, os.path.join( "/home/liuchao/Chat-Scene/annotations/scannet_odin_videofeats.pt"))
+
         return res     
 
     trainer = Trainer(cfg)
